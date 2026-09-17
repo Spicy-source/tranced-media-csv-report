@@ -36,7 +36,8 @@ def _read_csv(path: Path) -> tuple[list[str], list[list[str]]]:
             if len({header.casefold() for header in headers}) != len(headers):
                 raise CsvError(f"{path}: duplicate header")
             rows: list[list[str]] = []
-            for line_number, row in enumerate(reader, start=2):
+            for row in reader:
+                line_number = reader.line_num
                 if len(row) != len(headers):
                     raise CsvError(f"{path}:{line_number}: expected {len(headers)} columns, got {len(row)}")
                 rows.append(row)
@@ -61,12 +62,12 @@ def _totals(headers: list[str], rows: list[list[str]]) -> dict[str, Decimal]:
         try:
             amount = Decimal(raw_amount)
         except (InvalidOperation, ValueError) as exc:
-            raise CsvError(f"row {row_number}: invalid amount {row[amount_index]!r}") from exc
+            raise CsvError(f"merged row {row_number}: invalid amount {row[amount_index]!r}") from exc
         if not amount.is_finite():
-            raise CsvError(f"row {row_number}: amount must be finite")
+            raise CsvError(f"merged row {row_number}: amount must be finite")
         currency = row[currency_index].strip() if currency_index is not None else "(no currency column)"
         if not currency:
-            raise CsvError(f"row {row_number}: empty currency")
+            raise CsvError(f"merged row {row_number}: empty currency")
         try:
             with localcontext() as context:
                 context.prec = TOTAL_PRECISION
@@ -75,7 +76,7 @@ def _totals(headers: list[str], rows: list[list[str]]) -> dict[str, Decimal]:
                 context.traps[Rounded] = True
                 totals[currency] = totals.get(currency, Decimal("0")) + amount
         except DecimalException as exc:
-            raise CsvError(f"row {row_number}: amount exceeds {TOTAL_PRECISION}-digit exact-total limit") from exc
+            raise CsvError(f"merged row {row_number}: amount exceeds {TOTAL_PRECISION}-digit exact-total limit") from exc
     return totals
 
 
@@ -107,13 +108,22 @@ def merge(sources: list[Path], output: Path) -> dict[str, Decimal]:
     assert header is not None
     totals = _totals(header, all_rows)
     output.parent.mkdir(parents=True, exist_ok=True)
+    created = False
     try:
         with output.open("x", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\n")
+            created = True
+            writer = csv.writer(handle)
             writer.writerow(header)
             writer.writerows(all_rows)
-    except FileExistsError as exc:
-        raise CsvError(f"output already exists: {output}") from exc
+    except BaseException as exc:
+        if created:
+            try:
+                output.unlink()
+            except OSError as cleanup_error:
+                exc.add_note(f"Incomplete output could not be removed: {output}: {cleanup_error}")
+        elif isinstance(exc, FileExistsError):
+            raise CsvError(f"output already exists: {output}") from exc
+        raise
     return totals
 
 
@@ -132,7 +142,7 @@ def self_test() -> None:
         for path, text in [
             (sources[0], 'name,amount,currency,note\nÅse,1.10,DKK,"first line\nsecond line"\n'),
             (sources[1], 'name,amount,currency,note\n李,2.20,DKK,"quoted, comma"\n'),
-            (sources[2], 'name,amount,currency,note\nMia,3.30,EUR,plain\n'),
+            (sources[2], 'name,amount,currency,note\nMia,3.30,EUR,"bare\rreturn"\n'),
         ]:
             with path.open("w", encoding="utf-8", newline="") as handle:
                 handle.write(text)
@@ -144,7 +154,7 @@ def self_test() -> None:
             ["name", "amount", "currency", "note"],
             ["Åse", "1.10", "DKK", "first line\nsecond line"],
             ["李", "2.20", "DKK", "quoted, comma"],
-            ["Mia", "3.30", "EUR", "plain"],
+            ["Mia", "3.30", "EUR", "bare\rreturn"],
         ]
         assert totals == {"DKK": Decimal("3.30"), "EUR": Decimal("3.30")}
         _expect_error(lambda: merge([sources[0]], output))
@@ -171,6 +181,36 @@ def self_test() -> None:
         precision_loss = root / "precision-loss.csv"
         precision_loss.write_text(f'name,amount,currency\na,{"9" * 101},DKK\n', encoding="utf-8")
         _expect_error(lambda: merge([precision_loss], root / "precision-loss-out.csv"))
+        source_before = sources[0].read_bytes()
+        fault_output = root / "partial.csv"
+        original_writer = csv.writer
+
+        class PartialWriter:
+            def __init__(self, writer):
+                self.writer = writer
+
+            def writerow(self, row):
+                self.writer.writerow(row)
+                if row != ["name", "amount", "currency", "note"]:
+                    raise injected_failure
+
+            def writerows(self, rows):
+                for row in rows:
+                    self.writerow(row)
+
+        for injected_failure in (OSError("synthetic write failure"), KeyboardInterrupt()):
+            csv.writer = lambda handle: PartialWriter(original_writer(handle))
+            try:
+                try:
+                    merge([sources[0]], fault_output)
+                except BaseException as exc:
+                    assert exc is injected_failure
+                else:
+                    raise AssertionError("expected synthetic write failure")
+            finally:
+                csv.writer = original_writer
+            assert not fault_output.exists()
+            assert sources[0].read_bytes() == source_before
         _expect_error(lambda: merge([sources[0]], sources[0]))
     print("self-test passed")
 
