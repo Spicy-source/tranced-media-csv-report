@@ -2,6 +2,8 @@
 
 Synthetic portfolio proof for a CSV merge/reporting offer. It is not prior customer work.
 
+Requires Python 3.11 or later; no third-party packages.
+
 Built by Tranced Media using AI-assisted development and runnable checks. For a custom reporting workflow, contact **creatorcontact@tranced.me** with a description and redacted examples. Scope and price are agreed before customer work begins.
 
 ```powershell
